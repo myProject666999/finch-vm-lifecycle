@@ -157,5 +157,6 @@ func virtualMachineCommands(
 		fs,
 		deps.diskManager,
 		fc,
+		finchRootPath,
 	)
 }

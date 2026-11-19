@@ -7,184 +7,90 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 
-	"github.com/spf13/cobra"
-	"github.com/stretchr/testify/assert"
-	"go.uber.org/mock/gomock"
+	"github.com/runfinch/finch/pkg/flog"
+	"github.com/runfinch/finch/pkg/lifecycle"
 
-	"github.com/runfinch/finch/pkg/mocks"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewStatusVMCommand(t *testing.T) {
 	t.Parallel()
 
-	cmd := newStatusVMCommand(nil, nil, nil)
+	cmd := newStatusVMCommand(flog.NewLogrus(), &bytes.Buffer{}, nil)
 	assert.Equal(t, cmd.Name(), "status")
-}
-
-func TestStatusVMAction_runAdapter(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		name    string
-		command *cobra.Command
-		args    []string
-		mockSvc func(
-			*mocks.NerdctlCmdCreator,
-			*mocks.Logger,
-			*mocks.LimaConfigApplier,
-			*gomock.Controller,
-		)
-	}{
-		{
-			name: "should get nonexistent vm status",
-			command: &cobra.Command{
-				Use: "status",
-			},
-			args: []string{},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte(""), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "")
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			ctrl := gomock.NewController(t)
-			logger := mocks.NewLogger(ctrl)
-			stdout := bytes.Buffer{}
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			lca := mocks.NewLimaConfigApplier(ctrl)
-
-			tc.mockSvc(ncc, logger, lca, ctrl)
-
-			assert.NoError(t, newStatusVMAction(ncc, logger, &stdout).runAdapter(tc.command, tc.args))
-		})
-	}
 }
 
 func TestStatusVMAction_run(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name             string
-		wantErr          error
-		wantStatusOutput string
-		mockSvc          func(
-			*mocks.NerdctlCmdCreator,
-			*mocks.Logger,
-			*mocks.LimaConfigApplier,
-			*gomock.Controller,
-		)
-	}{
-		{
-			name:             "running VM",
-			wantErr:          nil,
-			wantStatusOutput: "Running\n",
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
-			},
-		},
-		{
-			name:             "stopped VM",
-			wantErr:          nil,
-			wantStatusOutput: "Stopped\n",
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-			},
-		},
-		{
-			name:             "nonExistent VM",
-			wantErr:          nil,
-			wantStatusOutput: "Nonexistent\n",
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte(""), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "")
-			},
-		},
-		{
-			name:             "unknown VM status",
-			wantErr:          errors.New("unrecognized system status"),
-			wantStatusOutput: "",
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Broken")
-			},
-		},
-		{
-			name:             "status command returns an error",
-			wantErr:          errors.New("get status error"),
-			wantStatusOutput: "",
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				_ *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), errors.New("get status error"))
-			},
-		},
-	}
+	t.Run("reports Nonexistent for an absent instance", func(t *testing.T) {
+		t.Parallel()
+		executor, _, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, executor).run())
+		assert.Contains(t, out.String(), "Nonexistent")
+	})
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	t.Run("reports Running for a booted instance", func(t *testing.T) {
+		t.Parallel()
+		executor, _, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, executor).run())
+		assert.Contains(t, out.String(), "Running")
+	})
 
-			ctrl := gomock.NewController(t)
-			logger := mocks.NewLogger(ctrl)
-			stdout := bytes.Buffer{}
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			lca := mocks.NewLimaConfigApplier(ctrl)
+	t.Run("reports Stopped for a halted, previously booted instance", func(t *testing.T) {
+		t.Parallel()
+		executor, _, _ := newTestExecutor(t, lifecycle.DriverStopped)
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, executor).run())
+		assert.Contains(t, out.String(), "Stopped")
+	})
 
-			tc.mockSvc(ncc, logger, lca, ctrl)
+	t.Run("explicitly marks a transitional in-progress state", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		driver.Block(lifecycle.ActionInit)
 
-			err := newStatusVMAction(ncc, logger, &stdout).run()
-			assert.Equal(t, err, tc.wantErr)
-			assert.Equal(t, tc.wantStatusOutput, stdout.String())
-		})
-	}
+		done := make(chan struct{})
+		go func() {
+			_, _ = executor.Init(t.Context())
+			close(done)
+		}()
+		waitForTestLock(t, executor)
+
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, executor).run())
+		// The transitional marker must be visible instead of a stable word.
+		assert.Contains(t, out.String(), "in progress")
+
+		driver.Release(lifecycle.ActionInit)
+		<-done
+	})
+
+	t.Run("surfaces a stale holder as a recoverable warning", func(t *testing.T) {
+		t.Parallel()
+		env := newTestExecutorEnv(t, lifecycle.DriverRunning)
+		env.seedStaleRecord(t, lifecycle.ActionStop)
+
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, env.manager).run())
+		assert.Contains(t, out.String(), "no longer exists")
+	})
+
+	t.Run("prints the needs-inspection warning after a forced stop", func(t *testing.T) {
+		t.Parallel()
+		executor, _, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+		_, err := executor.Stop(t.Context(), true)
+		require.NoError(t, err)
+
+		var out bytes.Buffer
+		require.NoError(t, newStatusVMAction(flog.NewLogrus(), &out, executor).run())
+		assert.Contains(t, out.String(), "needs inspection")
+	})
 }

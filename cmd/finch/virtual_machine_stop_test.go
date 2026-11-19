@@ -7,215 +7,131 @@ package main
 
 import (
 	"errors"
-	"fmt"
-	"runtime"
 	"testing"
 
+	"github.com/runfinch/finch/pkg/flog"
+	"github.com/runfinch/finch/pkg/lifecycle"
 	"github.com/runfinch/finch/pkg/mocks"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 
 func TestNewStopVMCommand(t *testing.T) {
 	t.Parallel()
 
-	cmd := newStopVMCommand(nil, nil, nil)
+	cmd := newStopVMCommand(nil, flog.NewLogrus(), nil)
 	assert.Equal(t, cmd.Name(), "stop")
 }
 
 func TestStopVMAction_runAdapter(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		mockSvc func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager)
-		args    []string
-		wantErr error
-	}{
-		{
-			name: "should stop the instance",
-			args: []string{},
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
+	t.Run("stops a running instance through the lifecycle manager", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
 
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("stop", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				if runtime.GOOS != "windows" {
-					logger.EXPECT().Warnf("Failed to stop credential server: %v", gomock.Any()).AnyTimes()
-				}
-				logger.EXPECT().Info(gomock.Any()).AnyTimes()
-			},
-			wantErr: nil,
-		},
-		{
-			name: "should force stop the instance",
-			args: []string{
-				"--force",
-			},
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager) {
-				command := mocks.NewCommand(ctrl)
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
-				creator.EXPECT().CreateWithoutStdio("stop", "--force", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				if runtime.GOOS != "windows" {
-					logger.EXPECT().Warnf("Failed to stop credential server: %v", gomock.Any()).AnyTimes()
-				}
-				logger.EXPECT().Info(gomock.Any()).AnyTimes()
-			},
-			wantErr: nil,
-		},
-	}
+		cmd := &cobra.Command{Use: "stop"}
+		cmd.Flags().BoolP("force", "f", false, "")
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).runAdapter(cmd, nil)
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverStopped, driver.State())
+	})
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	t.Run("--force maps to the driver's ForceStop and needs-check is surfaced", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-			ctrl := gomock.NewController(t)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			tc.mockSvc(logger, ncc, ctrl, dm)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
 
-			cmd := newStopVMCommand(ncc, dm, logger)
-			cmd.SetArgs(tc.args)
-			err := cmd.Execute()
-			assert.Equal(t, tc.wantErr, err)
-		})
-	}
+		cmd := &cobra.Command{Use: "stop"}
+		cmd.Flags().BoolP("force", "f", false, "")
+		require.NoError(t, cmd.Flags().Set("force", "true"))
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).runAdapter(cmd, nil)
+		require.NoError(t, err)
+
+		calls := driver.Calls()
+		require.Len(t, calls, 1)
+		assert.True(t, calls[0].Force)
+		st, err := executor.Status(t.Context())
+		require.NoError(t, err)
+		assert.True(t, st.NeedsCheck)
+	})
 }
 
 func TestStopVMAction_run(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		wantErr error
-		mockSvc func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager)
-		force   bool
-	}{
-		{
-			name:    "should stop the instance",
-			wantErr: nil,
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
+	t.Run("graceful stop succeeds", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("stop", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				if runtime.GOOS != "windows" {
-					logger.EXPECT().Warnf("Failed to stop credential server: %v", gomock.Any()).AnyTimes()
-				}
-				logger.EXPECT().Info("Stopping existing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine stopped successfully")
-			},
-			force: false,
-		},
-		{
-			name:    "stopped VM",
-			wantErr: fmt.Errorf("the instance %q is already stopped", limaInstanceName),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, _ *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-			},
-			force: false,
-		},
-		{
-			name:    "nonexistent VM",
-			wantErr: fmt.Errorf("the instance %q does not exist", limaInstanceName),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, _ *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte(""), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "")
-			},
-			force: false,
-		},
-		{
-			name:    "unknown VM status",
-			wantErr: errors.New("unrecognized system status"),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, _ *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Broken")
-			},
-			force: false,
-		},
-		{
-			name:    "status command returns an error",
-			wantErr: errors.New("get status error"),
-			mockSvc: func(_ *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, _ *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), errors.New("get status error"))
-			},
-			force: false,
-		},
-		{
-			name:    "should print error if virtual machine failed to stop",
-			wantErr: errors.New("error"),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
 
-				logs := []byte("stdout + stderr")
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput().Return(logs, errors.New("error"))
-				creator.EXPECT().CreateWithoutStdio("stop", limaInstanceName).Return(command)
-				if runtime.GOOS != "windows" {
-					logger.EXPECT().Warnf("Failed to stop credential server: %v", gomock.Any()).AnyTimes()
-				}
-				logger.EXPECT().Info("Stopping existing Finch virtual machine...")
-				logger.EXPECT().Errorf("Finch virtual machine failed to stop, debug logs:\n%s", logs)
-			},
-			force: false,
-		},
-		{
-			name:    "should force stop virtual machine",
-			wantErr: nil,
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, ctrl *gomock.Controller, dm *mocks.UserDataDiskManager) {
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("stop", "--force", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
-				if runtime.GOOS != "windows" {
-					logger.EXPECT().Warnf("Failed to stop credential server: %v", gomock.Any()).AnyTimes()
-				}
-				logger.EXPECT().Info("Forcibly stopping Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine stopped successfully")
-			},
-			force: true,
-		},
-	}
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverStopped, driver.State())
+	})
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	t.Run("stopped VM is a successful no-op with no driver call", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-			ctrl := gomock.NewController(t)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverStopped)
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.NoError(t, err, "idempotent stop exits 0")
+		assert.Empty(t, driver.Calls())
+	})
 
-			tc.mockSvc(logger, ncc, ctrl, dm)
-			err := newStopVMAction(ncc, dm, logger).run(tc.force)
-			assert.Equal(t, tc.wantErr, err)
-		})
-	}
+	t.Run("nonexistent VM is rejected with the documented exit code", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
+
+		executor, _, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.Error(t, err)
+		var coder interface{ ExitCode() int }
+		require.ErrorAs(t, err, &coder)
+		assert.Equal(t, lifecycle.ExitInvalidTransition, coder.ExitCode())
+	})
+
+	t.Run("driver failure is reported with the driver-failure exit code", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
+
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+		driver.FailNext(lifecycle.ActionStop, 1, errors.New("limactl exploded"))
+
+		err := newStopVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrDriverFailed)
+	})
+}
+
+// executorTestSeedRunning drives a fresh executor through init so its operation
+// record contains a completed boot and its fake driver reaches Running.
+func executorTestSeedRunning(t *testing.T, executor lifecycleExecutor) {
+	t.Helper()
+	_, err := executor.Init(t.Context())
+	require.NoError(t, err)
 }

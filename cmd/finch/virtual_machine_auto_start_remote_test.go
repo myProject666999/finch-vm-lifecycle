@@ -11,9 +11,12 @@ import (
 
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/runfinch/finch/pkg/config"
+	"github.com/runfinch/finch/pkg/flog"
+	"github.com/runfinch/finch/pkg/lifecycle"
 	"github.com/runfinch/finch/pkg/mocks"
 )
 
@@ -74,4 +77,44 @@ func TestVMAutoStarter(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVMAutoStarterUsesLifecycleExecutor verifies the auto-start path drives the
+// same lock-protected lifecycle state machine as the explicit vm commands when
+// an executor is injected (production injects the limactl-backed one).
+func TestVMAutoStarterUsesLifecycleExecutor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stopped instance gets started through the executor", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverStopped)
+		starter := &vmAutoStarter{
+			logger:           flog.NewLogrus(),
+			fs:               afero.NewMemMapFs(),
+			fc:               &config.Finch{},
+			executorOverride: executor,
+		}
+
+		exec, _ := starter.executor()
+		_, err := exec.Start(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverRunning, driver.State())
+	})
+
+	t.Run("absent instance gets initialized through the executor", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		starter := &vmAutoStarter{
+			logger:           flog.NewLogrus(),
+			fs:               afero.NewMemMapFs(),
+			fc:               &config.Finch{},
+			executorOverride: executor,
+		}
+
+		exec, _ := starter.executor()
+		_, err := exec.Init(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverRunning, driver.State())
+		assert.Equal(t, lifecycle.ActionInit, driver.Calls()[0].Action)
+	})
 }

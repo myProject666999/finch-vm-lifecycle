@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/afero"
@@ -13,6 +14,7 @@ import (
 	"github.com/runfinch/finch/pkg/command"
 	"github.com/runfinch/finch/pkg/config"
 	"github.com/runfinch/finch/pkg/flog"
+	"github.com/runfinch/finch/pkg/lifecycle"
 	"github.com/runfinch/finch/pkg/lima"
 	"github.com/runfinch/finch/pkg/path"
 )
@@ -26,6 +28,9 @@ type vmAutoStarter struct {
 	fc            *config.Finch
 	home          string
 	finchRootPath string
+	// executorOverride, when non-nil, replaces the production lock-protected
+	// executor. Tests inject one backed by the in-memory fake driver.
+	executorOverride lifecycleExecutor
 }
 
 func newVMAutoStarter(
@@ -50,59 +55,59 @@ func newVMAutoStarter(
 	}
 }
 
+// executor builds the same lock-protected executor the `finch vm` commands use,
+// so automatic start/init participates in the identical state machine and
+// cross-process mutual exclusion.
+func (v *vmAutoStarter) executor() (lifecycleExecutor, *vmDependencies) {
+	// An injected executor (tests) needs none of the production dependency wiring;
+	// skip it so a test harness does not have to construct a full Lima stack.
+	if v.executorOverride != nil {
+		return v.executorOverride, nil
+	}
+	deps := buildVMDependencies(v.logger, v.fp, v.ncc, v.ecc, v.fs, v.fc, v.home, v.finchRootPath)
+	exec := newVMExecutor(v.fp, v.finchRootPath, v.fs, v.fc, v.logger, deps.optionalDepGroups, deps.lca,
+		deps.diskManager)
+	return exec, deps
+}
+
 func (v *vmAutoStarter) EnsureVMRunning() error {
-	status, err := lima.GetVMStatus(v.ncc, v.logger, limaInstanceName)
+	// Use the lock-free status path to choose between init and start without
+	// blocking; the actual mutating call then takes the lock like any other.
+	deps := buildVMDependencies(v.logger, v.fp, v.ncc, v.ecc, v.fs, v.fc, v.home, v.finchRootPath)
+	driverStatus, err := lima.GetVMStatus(v.ncc, v.logger, limaInstanceName)
 	if err != nil {
 		return err
 	}
 
-	switch status {
+	switch driverStatus {
 	case lima.Running:
 		return nil
 	case lima.Nonexistent:
-		return v.initVM()
+		return v.initVM(deps)
 	case lima.Stopped:
-		return v.startVM()
+		return v.startVM(deps)
 	default:
 		return fmt.Errorf("instance %q has an unknown status", limaInstanceName)
 	}
 }
 
-func (v *vmAutoStarter) deps() *vmDependencies {
-	return buildVMDependencies(v.logger, v.fp, v.ncc, v.ecc, v.fs, v.fc, v.home, v.finchRootPath)
-}
-
-func (v *vmAutoStarter) initVM() error {
-	deps := v.deps()
-	initAction := newInitVMAction(
-		v.ncc,
-		v.logger,
-		deps.optionalDepGroups,
-		deps.lca,
-		v.fp.BaseYamlFilePath(),
-		deps.diskManager,
-		v.fc,
-	)
-	if err := initAction.run(); err != nil {
+func (v *vmAutoStarter) initVM(deps *vmDependencies) error {
+	exec, _ := v.executor()
+	ctx, cancel := lifecycle.WithSignalHandling(context.Background())
+	defer cancel()
+	if _, err := exec.Init(ctx); err != nil {
 		return err
 	}
-
 	return v.postStartConfig(deps)
 }
 
-func (v *vmAutoStarter) startVM() error {
-	deps := v.deps()
-	startAction := newStartVMAction(
-		v.ncc,
-		v.logger,
-		deps.optionalDepGroups,
-		deps.lca,
-		deps.diskManager,
-	)
-	if err := startAction.run(); err != nil {
+func (v *vmAutoStarter) startVM(deps *vmDependencies) error {
+	exec, _ := v.executor()
+	ctx, cancel := lifecycle.WithSignalHandling(context.Background())
+	defer cancel()
+	if _, err := exec.Start(ctx); err != nil {
 		return err
 	}
-
 	return v.postStartConfig(deps)
 }
 

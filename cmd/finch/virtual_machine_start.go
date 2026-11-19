@@ -6,15 +6,12 @@
 package main
 
 import (
-	"fmt"
-
-	"github.com/runfinch/finch/pkg/disk"
-
 	"github.com/runfinch/finch/pkg/command"
 	"github.com/runfinch/finch/pkg/config"
 	"github.com/runfinch/finch/pkg/dependency"
+	"github.com/runfinch/finch/pkg/disk"
 	"github.com/runfinch/finch/pkg/flog"
-	"github.com/runfinch/finch/pkg/lima"
+	"github.com/runfinch/finch/pkg/lifecycle"
 
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
@@ -29,37 +26,23 @@ func newStartVMCommand(
 	fs afero.Fs,
 	privateKeyPath string,
 	dm disk.UserDataDiskManager,
+	executor lifecycleExecutor,
 ) *cobra.Command {
 	return &cobra.Command{
 		Use:      "start",
 		Short:    "Start the virtual machine",
-		RunE:     newStartVMAction(ncc, logger, optionalDepGroups, lca, dm).runAdapter,
+		RunE:     newStartVMAction(logger, executor).runAdapter,
 		PostRunE: newPostVMStartInitAction(logger, ncc, fs, privateKeyPath, nca).runAdapter,
 	}
 }
 
 type startVMAction struct {
-	creator             command.NerdctlCmdCreator
-	logger              flog.Logger
-	optionalDepGroups   []*dependency.Group
-	limaConfigApplier   config.LimaConfigApplier
-	userDataDiskManager disk.UserDataDiskManager
+	logger   flog.Logger
+	executor lifecycleExecutor
 }
 
-func newStartVMAction(
-	creator command.NerdctlCmdCreator,
-	logger flog.Logger,
-	optionalDepGroups []*dependency.Group,
-	lca config.LimaConfigApplier,
-	dm disk.UserDataDiskManager,
-) *startVMAction {
-	return &startVMAction{
-		creator:             creator,
-		logger:              logger,
-		optionalDepGroups:   optionalDepGroups,
-		limaConfigApplier:   lca,
-		userDataDiskManager: dm,
-	}
+func newStartVMAction(logger flog.Logger, executor lifecycleExecutor) *startVMAction {
+	return &startVMAction{logger: logger, executor: executor}
 }
 
 func (sva *startVMAction) runAdapter(_ *cobra.Command, _ []string) error {
@@ -67,51 +50,17 @@ func (sva *startVMAction) runAdapter(_ *cobra.Command, _ []string) error {
 }
 
 func (sva *startVMAction) run() error {
-	err := sva.assertVMIsStopped(sva.creator, sva.logger)
-	if err != nil {
-		return err
-	}
-	err = dependency.InstallOptionalDeps(sva.optionalDepGroups, sva.logger)
-	if err != nil {
-		sva.logger.Errorf("Dependency error: %v", err)
-	}
+	ctx, cancel := lifecycle.WithSignalHandling(signalBackgroundContext())
+	defer cancel()
 
-	err = sva.limaConfigApplier.ConfigureOverrideLimaYaml()
+	res, err := sva.executor.Start(ctx)
 	if err != nil {
-		return err
+		return wrapLifecycleError(err)
 	}
-
-	// TODO: don't run this on Windows
-	err = sva.userDataDiskManager.EnsureUserDataDisk()
-	if err != nil {
-		return err
-	}
-
-	limaCmd := sva.creator.CreateWithoutStdio("start", limaInstanceName)
-	sva.logger.Info("Starting existing Finch virtual machine...")
-	logs, err := limaCmd.CombinedOutput()
-	if err != nil {
-		sva.logger.SetFormatter(flog.TextWithoutTruncation)
-		sva.logger.Errorf("Finch virtual machine failed to start, debug logs:\n%s", logs)
-		sva.logger.SetFormatter(flog.Text)
-		return err
-	}
-	sva.logger.Info("Finch virtual machine started successfully")
-	return nil
-}
-
-func (sva *startVMAction) assertVMIsStopped(creator command.NerdctlCmdCreator, logger flog.Logger) error {
-	status, err := lima.GetVMStatus(creator, logger, limaInstanceName)
-	if err != nil {
-		return err
-	}
-	switch status {
-	case lima.Nonexistent:
-		return fmt.Errorf("the instance %q does not exist, run `finch %s init` to create a new instance",
-			limaInstanceName, virtualMachineRootCmd)
-	case lima.Running:
-		return fmt.Errorf("the instance %q is already running", limaInstanceName)
-	default:
+	if res.Noop {
+		sva.logger.Info(res.Message)
 		return nil
 	}
+	sva.logger.Info(res.Message)
+	return nil
 }

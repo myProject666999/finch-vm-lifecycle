@@ -7,360 +7,100 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
-	"github.com/runfinch/finch/pkg/dependency"
 	"github.com/runfinch/finch/pkg/flog"
-	"github.com/runfinch/finch/pkg/mocks"
+	"github.com/runfinch/finch/pkg/lifecycle"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/mock/gomock"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewStartVMCommand(t *testing.T) {
 	t.Parallel()
 
-	cmd := newStartVMCommand(nil, nil, nil, nil, nil, nil, "", nil)
+	cmd := newStartVMCommand(nil, nil, nil, nil, nil, nil, "", nil, nil)
 	assert.Equal(t, cmd.Name(), "start")
 }
 
 func TestStartVMAction_runAdapter(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		wantErr error
-		command *cobra.Command
-		args    []string
-		groups  func(*gomock.Controller) []*dependency.Group
-		mockSvc func(
-			*mocks.NerdctlCmdCreator,
-			*mocks.Logger,
-			*mocks.LimaConfigApplier,
-			*mocks.UserDataDiskManager,
-			*gomock.Controller,
-		)
-	}{
-		{
-			name:    "should start instance",
-			wantErr: nil,
-			command: &cobra.Command{
-				Use: "start",
-			},
-			groups: func(ctrl *gomock.Controller) []*dependency.Group {
-				dep := mocks.NewDependency(ctrl)
-				deps := dependency.NewGroup([]dependency.Dependency{dep}, "", "")
-				groups := []*dependency.Group{deps}
+	t.Run("starts an initialized, stopped instance", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverStopped)
 
-				dep.EXPECT().Installed().Return(false)
-				dep.EXPECT().RequiresRoot().Return(false)
-				dep.EXPECT().Install().Return(nil)
-
-				return groups
-			},
-			args: []string{},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				lca *mocks.LimaConfigApplier,
-				dm *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-
-				lca.EXPECT().ConfigureOverrideLimaYaml().Return(nil)
-
-				dm.EXPECT().EnsureUserDataDisk().Return(nil)
-
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput()
-				ncc.EXPECT().CreateWithoutStdio("start", limaInstanceName).Return(command)
-
-				logger.EXPECT().Info("Starting existing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine started successfully")
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			ctrl := gomock.NewController(t)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			lca := mocks.NewLimaConfigApplier(ctrl)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-
-			groups := tc.groups(ctrl)
-			tc.mockSvc(ncc, logger, lca, dm, ctrl)
-
-			err := newStartVMAction(ncc, logger, groups, lca, dm).runAdapter(tc.command, tc.args)
-			assert.Equal(t, tc.wantErr, err)
-		})
-	}
+		err := newStartVMAction(flog.NewLogrus(), executor).runAdapter(&cobra.Command{Use: "start"}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverRunning, driver.State())
+		calls := driver.Calls()
+		require.Len(t, calls, 1)
+		assert.Equal(t, lifecycle.ActionStart, calls[0].Action)
+	})
 }
 
 func TestStartVMAction_run(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		wantErr error
-		groups  func(*gomock.Controller) []*dependency.Group
-		mockSvc func(
-			*mocks.NerdctlCmdCreator,
-			*mocks.Logger,
-			*mocks.LimaConfigApplier,
-			*mocks.UserDataDiskManager,
-			*gomock.Controller,
-		)
-	}{
-		{
-			name:    "should start instance if instance exists",
-			wantErr: nil,
-			groups: func(ctrl *gomock.Controller) []*dependency.Group {
-				dep := mocks.NewDependency(ctrl)
-				deps := dependency.NewGroup([]dependency.Dependency{dep}, "", "")
-				groups := []*dependency.Group{deps}
+	t.Run("start on an uninitialized VM is rejected and tells the caller to init", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
 
-				dep.EXPECT().Installed().Return(false)
-				dep.EXPECT().RequiresRoot().Return(false)
-				dep.EXPECT().Install().Return(nil)
+		err := newStartVMAction(flog.NewLogrus(), executor).run()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrInvalidTransition)
+		assert.Contains(t, err.Error(), "init")
+		var coder interface{ ExitCode() int }
+		require.ErrorAs(t, err, &coder)
+		assert.Equal(t, lifecycle.ExitInvalidTransition, coder.ExitCode())
+		assert.Empty(t, driver.Calls(), "a rejected start must not reach the driver")
+	})
 
-				return groups
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				lca *mocks.LimaConfigApplier,
-				dm *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
+	t.Run("start on a running VM is a successful no-op, exit 0, no driver call", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+		callsBefore := len(driver.Calls())
 
-				lca.EXPECT().ConfigureOverrideLimaYaml().Return(nil)
+		res, err := executor.Start(t.Context())
+		require.NoError(t, err)
+		assert.True(t, res.Noop)
+		// And through the cobra action it remains a clean success.
+		require.NoError(t, newStartVMAction(flog.NewLogrus(), executor).run())
+		assert.Len(t, driver.Calls(), callsBefore)
+	})
 
-				dm.EXPECT().EnsureUserDataDisk().Return(nil)
+	t.Run("start while stopping is refused with the concurrent-operation exit code", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverRunning)
+		driver.Block(lifecycle.ActionStop)
 
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput()
-				ncc.EXPECT().CreateWithoutStdio("start", limaInstanceName).Return(command)
+		stopErr := make(chan error, 1)
+		go func() {
+			_, err := executor.Stop(t.Context(), false)
+			stopErr <- err
+		}()
+		waitForTestLock(t, executor)
 
-				logger.EXPECT().Info("Starting existing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine started successfully")
-			},
-		},
-		{
-			name:    "running VM",
-			wantErr: fmt.Errorf("the instance %q is already running", limaInstanceName),
-			groups: func(_ *gomock.Controller) []*dependency.Group {
-				return nil
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				_ *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
-			},
-		},
-		{
-			name: "nonexistent VM",
-			wantErr: fmt.Errorf("the instance %q does not exist, run `finch %s init` to create a new instance",
-				limaInstanceName, virtualMachineRootCmd),
-			groups: func(_ *gomock.Controller) []*dependency.Group {
-				return nil
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				_ *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte(""), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "")
-			},
-		},
-		{
-			name:    "unknown VM status",
-			wantErr: errors.New("unrecognized system status"),
-			groups: func(_ *gomock.Controller) []*dependency.Group {
-				return nil
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				_ *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Broken")
-			},
-		},
-		{
-			name:    "status command returns an error",
-			wantErr: errors.New("get status error"),
-			groups: func(_ *gomock.Controller) []*dependency.Group {
-				return nil
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				_ *mocks.Logger,
-				_ *mocks.LimaConfigApplier,
-				_ *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), errors.New("get status error"))
-			},
-		},
-		{
-			// TODO: split this test case up:
-			// should succeed even if some optional dependencies fail to be installed
-			// return an error if Lima config fails to be applied
-			name:    "should return error if LoadAndApplyLimaConfig fails",
-			wantErr: errors.New("load config fails"),
-			groups: func(_ *gomock.Controller) []*dependency.Group {
-				return nil
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				lca *mocks.LimaConfigApplier,
-				_ *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
+		err := newStartVMAction(flog.NewLogrus(), executor).run()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrConcurrentOperation)
+		var coder interface{ ExitCode() int }
+		require.ErrorAs(t, err, &coder)
+		assert.Equal(t, lifecycle.ExitConcurrent, coder.ExitCode())
 
-				lca.EXPECT().ConfigureOverrideLimaYaml().Return(errors.New("load config fails"))
-			},
-		},
-		{
-			// should succeed even if some optional dependencies fail to be installed
-			// return an error if Lima config fails to be applied
-			name:    "should print out error if InstallOptionalDeps fails",
-			wantErr: nil,
-			groups: func(ctrl *gomock.Controller) []*dependency.Group {
-				dep := mocks.NewDependency(ctrl)
-				deps := dependency.NewGroup([]dependency.Dependency{dep}, "", "mock_error_msg")
-				groups := []*dependency.Group{deps}
+		driver.Release(lifecycle.ActionStop)
+		require.NoError(t, <-stopErr)
+	})
 
-				dep.EXPECT().Installed().Return(false)
-				dep.EXPECT().RequiresRoot().Return(false)
-				dep.EXPECT().Install().Return(errors.New("dependency error occurs"))
+	t.Run("driver failure surfaces as a driver error and leaves a recoverable record", func(t *testing.T) {
+		t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverStopped)
+		driver.FailNext(lifecycle.ActionStart, 1, errors.New("boot failed"))
 
-				return groups
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				lca *mocks.LimaConfigApplier,
-				dm *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-
-				lca.EXPECT().ConfigureOverrideLimaYaml().Return(nil)
-
-				dm.EXPECT().EnsureUserDataDisk().Return(nil)
-
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput()
-				ncc.EXPECT().CreateWithoutStdio("start", limaInstanceName).Return(command)
-
-				logger.EXPECT().Info("Starting existing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine started successfully")
-
-				logger.EXPECT().Errorf("Dependency error: %v",
-					fmt.Errorf("failed to install dependencies: %w",
-						errors.Join(fmt.Errorf("%s: %w", "mock_error_msg", errors.Join(errors.New("dependency error occurs")))),
-					),
-				)
-			},
-		},
-		{
-			name:    "should print out error if instance fails to start",
-			wantErr: errors.New("start command error"),
-			groups: func(ctrl *gomock.Controller) []*dependency.Group {
-				dep := mocks.NewDependency(ctrl)
-				deps := dependency.NewGroup([]dependency.Dependency{dep}, "", "")
-				groups := []*dependency.Group{deps}
-
-				dep.EXPECT().Installed().Return(true)
-
-				return groups
-			},
-			mockSvc: func(
-				ncc *mocks.NerdctlCmdCreator,
-				logger *mocks.Logger,
-				lca *mocks.LimaConfigApplier,
-				dm *mocks.UserDataDiskManager,
-				ctrl *gomock.Controller,
-			) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				ncc.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-
-				lca.EXPECT().ConfigureOverrideLimaYaml().Return(nil)
-
-				dm.EXPECT().EnsureUserDataDisk().Return(nil)
-
-				logs := []byte("stdout + stderr")
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput().Return(logs, errors.New("start command error"))
-				ncc.EXPECT().CreateWithoutStdio("start", limaInstanceName).Return(command)
-
-				logger.EXPECT().Info("Starting existing Finch virtual machine...")
-				logger.EXPECT().SetFormatter(flog.TextWithoutTruncation)
-				logger.EXPECT().Errorf("Finch virtual machine failed to start, debug logs:\n%s", logs)
-				logger.EXPECT().SetFormatter(flog.Text)
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			ctrl := gomock.NewController(t)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			lca := mocks.NewLimaConfigApplier(ctrl)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-
-			groups := tc.groups(ctrl)
-			tc.mockSvc(ncc, logger, lca, dm, ctrl)
-
-			err := newStartVMAction(ncc, logger, groups, lca, dm).run()
-			assert.Equal(t, err, tc.wantErr)
-		})
-	}
+		err := newStartVMAction(flog.NewLogrus(), executor).run()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrDriverFailed)
+	})
 }

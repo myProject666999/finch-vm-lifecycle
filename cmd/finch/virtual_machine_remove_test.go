@@ -7,199 +7,129 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
+	"github.com/runfinch/finch/pkg/flog"
+	"github.com/runfinch/finch/pkg/lifecycle"
 	"github.com/runfinch/finch/pkg/mocks"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 
 func TestNewRemoveVMCommand(t *testing.T) {
 	t.Parallel()
 
-	cmd := newRemoveVMCommand(nil, nil, nil)
+	cmd := newRemoveVMCommand(nil, flog.NewLogrus(), nil)
 	assert.Equal(t, cmd.Name(), "remove")
 }
 
 func TestRemoveVMAction_runAdapter(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		mockSvc func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller)
-		args    []string
-	}{
-		{
-			name: "should remove the instance",
-			args: []string{},
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-				logger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("remove", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				logger.EXPECT().Info(gomock.Any()).AnyTimes()
-			},
-		},
-		{
-			name: "should forcibly remove the instance",
-			args: []string{
-				"--force",
-			},
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				logger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-				command := mocks.NewCommand(ctrl)
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
-				creator.EXPECT().CreateWithoutStdio("remove", "--force", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				logger.EXPECT().Info(gomock.Any()).AnyTimes()
-			},
-		},
-	}
+	t.Run("removes a stopped instance through the lifecycle manager", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+		_, err := executor.Stop(t.Context(), false)
+		require.NoError(t, err)
 
-			ctrl := gomock.NewController(t)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
-			tc.mockSvc(logger, ncc, dm, ctrl)
+		cmd := &cobra.Command{Use: "remove"}
+		cmd.Flags().BoolP("force", "f", false, "")
+		err = newRemoveVMAction(dm, flog.NewLogrus(), executor).runAdapter(cmd, nil)
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverAbsent, driver.State())
 
-			cmd := newRemoveVMCommand(ncc, dm, logger)
-			cmd.SetArgs(tc.args)
-			assert.NoError(t, cmd.Execute())
-		})
-	}
+		st, err := executor.Status(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.Uninitialized, st.State)
+	})
+
+	t.Run("--force on a running instance force-stops then removes", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
+
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
+
+		cmd := &cobra.Command{Use: "remove"}
+		cmd.Flags().BoolP("force", "f", false, "")
+		require.NoError(t, cmd.Flags().Set("force", "true"))
+		err := newRemoveVMAction(dm, flog.NewLogrus(), executor).runAdapter(cmd, nil)
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.DriverAbsent, driver.State())
+
+		// The remove path contains a forced stop before the removal.
+		var sawForceStop, sawRemove bool
+		for _, c := range driver.Calls() {
+			if c.Action == lifecycle.ActionStop && c.Force {
+				sawForceStop = true
+			}
+			if c.Action == lifecycle.ActionRemove {
+				sawRemove = true
+			}
+		}
+		assert.True(t, sawForceStop)
+		assert.True(t, sawRemove)
+	})
 }
 
 func TestRemoveVMAction_run(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name    string
-		wantErr error
-		mockSvc func(*mocks.Logger, *mocks.NerdctlCmdCreator, *mocks.UserDataDiskManager, *gomock.Controller)
-		force   bool
-	}{
-		{
-			name:    "should remove the instance",
-			wantErr: nil,
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-				logger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
+	t.Run("remove on a running instance without --force is rejected with stop guidance", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("remove", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				logger.EXPECT().Info("Removing existing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine removed successfully")
-			},
-			force: false,
-		},
-		{
-			name: "running VM",
-			wantErr: fmt.Errorf("the instance %q is running, run `finch %s stop` to stop the instance first",
-				limaInstanceName, virtualMachineRootCmd),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, _ *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Running"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Running")
-			},
-			force: false,
-		},
-		{
-			name:    "nonexistent VM",
-			wantErr: fmt.Errorf("the instance %q does not exist", limaInstanceName),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, _ *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte(""), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "")
-			},
-			force: false,
-		},
-		{
-			name:    "unknown VM status",
-			wantErr: errors.New("unrecognized system status"),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, _ *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Broken")
-			},
-			force: false,
-		},
-		{
-			name:    "status command returns an error",
-			wantErr: errors.New("get status error"),
-			mockSvc: func(_ *mocks.Logger, creator *mocks.NerdctlCmdCreator, _ *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Broken"), errors.New("get status error"))
-			},
-			force: false,
-		},
-		{
-			name:    "should print error if virtual machine failed to remove",
-			wantErr: errors.New("failed to remove instance"),
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				getVMStatusC := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("ls", "-f", "{{.Status}}", limaInstanceName).Return(getVMStatusC)
-				getVMStatusC.EXPECT().Output().Return([]byte("Stopped"), nil)
-				logger.EXPECT().Debugf("Status of virtual machine: %s", "Stopped")
-				logger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		executorTestSeedRunning(t, executor)
 
-				logs := []byte("stdout + stderr")
-				command := mocks.NewCommand(ctrl)
-				command.EXPECT().CombinedOutput().Return(logs, errors.New("failed to remove instance"))
-				creator.EXPECT().CreateWithoutStdio("remove", limaInstanceName).Return(command)
-				logger.EXPECT().Info("Removing existing Finch virtual machine...")
-				logger.EXPECT().Errorf("Finch virtual machine failed to remove, debug logs:\n%s", logs)
-			},
-			force: false,
-		},
-		{
-			name:    "should forcibly remove the instance",
-			wantErr: nil,
-			mockSvc: func(logger *mocks.Logger, creator *mocks.NerdctlCmdCreator, dm *mocks.UserDataDiskManager, ctrl *gomock.Controller) {
-				logger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-				command := mocks.NewCommand(ctrl)
-				creator.EXPECT().CreateWithoutStdio("remove", "--force", limaInstanceName).Return(command)
-				command.EXPECT().CombinedOutput()
-				dm.EXPECT().DetachUserDataDisk().Return(nil)
-				logger.EXPECT().Info("Forcibly removing Finch virtual machine...")
-				logger.EXPECT().Info("Finch virtual machine removed successfully")
-			},
-			force: true,
-		},
-	}
+		err := newRemoveVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrInvalidTransition)
+		assert.Contains(t, err.Error(), "stop")
+		assert.NotContains(t, driver.Calls(), lifecycle.ActionRemove)
+	})
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	t.Run("remove on an absent instance is rejected", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil)
 
-			ctrl := gomock.NewController(t)
-			dm := mocks.NewUserDataDiskManager(ctrl)
-			logger := mocks.NewLogger(ctrl)
-			ncc := mocks.NewNerdctlCmdCreator(ctrl)
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverAbsent)
+		err := newRemoveVMAction(dm, flog.NewLogrus(), executor).run(false)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, lifecycle.ErrInvalidTransition)
+		assert.Empty(t, driver.Calls())
+	})
 
-			tc.mockSvc(logger, ncc, dm, ctrl)
-			err := newRemoveVMAction(ncc, dm, logger).run(tc.force)
-			assert.Equal(t, tc.wantErr, err)
-		})
-	}
+	t.Run("remove is the only mutating command accepted on a corrupted instance", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		dm := mocks.NewUserDataDiskManager(ctrl)
+		dm.EXPECT().DetachUserDataDisk().Return(nil).Times(2)
+
+		executor, driver, _ := newTestExecutor(t, lifecycle.DriverStopped)
+		driver.FailNextLeavingState(lifecycle.ActionInit, 1, lifecycle.DriverStopped, errors.New("half create"))
+		_ = newInitVMAction(flog.NewLogrus(), executor).run() // leaves Corrupted
+
+		st, err := executor.Status(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, lifecycle.Corrupted, st.State)
+
+		// Remove is accepted and performs the cleanup.
+		require.NoError(t, newRemoveVMAction(dm, flog.NewLogrus(), executor).run(false))
+		assert.Equal(t, lifecycle.DriverAbsent, driver.State())
+	})
 }

@@ -6,24 +6,22 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/runfinch/finch/pkg/command"
 	credserver "github.com/runfinch/finch/pkg/credserver"
 	"github.com/runfinch/finch/pkg/disk"
 	"github.com/runfinch/finch/pkg/flog"
-	"github.com/runfinch/finch/pkg/lima"
+	"github.com/runfinch/finch/pkg/lifecycle"
 
 	"github.com/spf13/cobra"
 )
 
-func newRemoveVMCommand(limaCmdCreator command.NerdctlCmdCreator, diskManager disk.UserDataDiskManager, logger flog.Logger) *cobra.Command {
+func newRemoveVMCommand(diskManager disk.UserDataDiskManager, logger flog.Logger, executor lifecycleExecutor) *cobra.Command {
 	removeVMCommand := &cobra.Command{
 		Use:   "remove",
 		Short: "Remove the virtual machine instance",
-		RunE:  newRemoveVMAction(limaCmdCreator, diskManager, logger).runAdapter,
+		RunE:  newRemoveVMAction(diskManager, logger, executor).runAdapter,
 	}
 
 	removeVMCommand.Flags().BoolP("force", "f", false, "forcibly remove finch VM")
@@ -32,13 +30,13 @@ func newRemoveVMCommand(limaCmdCreator command.NerdctlCmdCreator, diskManager di
 }
 
 type removeVMAction struct {
-	creator     command.NerdctlCmdCreator
-	logger      flog.Logger
 	diskManager disk.UserDataDiskManager
+	logger      flog.Logger
+	executor    lifecycleExecutor
 }
 
-func newRemoveVMAction(creator command.NerdctlCmdCreator, diskManager disk.UserDataDiskManager, logger flog.Logger) *removeVMAction {
-	return &removeVMAction{creator: creator, logger: logger, diskManager: diskManager}
+func newRemoveVMAction(diskManager disk.UserDataDiskManager, logger flog.Logger, executor lifecycleExecutor) *removeVMAction {
+	return &removeVMAction{diskManager: diskManager, logger: logger, executor: executor}
 }
 
 func (rva *removeVMAction) runAdapter(cmd *cobra.Command, _ []string) error {
@@ -50,70 +48,31 @@ func (rva *removeVMAction) runAdapter(cmd *cobra.Command, _ []string) error {
 }
 
 func (rva *removeVMAction) run(force bool) error {
-	if force {
-		return rva.removeVM(force)
-	}
-
-	err := rva.assertVMIsStopped(rva.creator, rva.logger)
-	if err != nil {
-		return err
-	}
-
-	return rva.removeVM(false)
-}
-
-func (rva *removeVMAction) assertVMIsStopped(creator command.NerdctlCmdCreator, logger flog.Logger) error {
-	status, err := lima.GetVMStatus(creator, logger, limaInstanceName)
-	if err != nil {
-		return err
-	}
-	switch status {
-	case lima.Nonexistent:
-		return fmt.Errorf("the instance %q does not exist", limaInstanceName)
-	case lima.Running:
-		return fmt.Errorf("the instance %q is running, run `finch %s stop` to stop the instance first",
-			limaInstanceName, virtualMachineRootCmd)
-	default:
-		return nil
-	}
-}
-
-func (rva *removeVMAction) removeVM(force bool) error {
-	// Stop credential server before VM stops (macOS only)
-	// macOS: Credential server runs on host and communicates with VM via Unix socket using finchhost credential helper
-	// Windows: No credential server needed - WSL can access credentials and credhelpers via mounted ~/.finch/config.json
-	execPath, err := os.Executable()
-	if err == nil {
-		// Resolve symlink to get actual installation path
-		realPath, err := filepath.EvalSymlinks(execPath)
-		if err != nil {
-			realPath = execPath
-		}
-		finchRootPath := filepath.Dir(filepath.Dir(realPath))
-		if err := credserver.StopCredentialServer(finchRootPath); err != nil {
-			rva.logger.Warnf("Failed to stop credential server: %v", err)
-		}
-	}
-
+	rva.stopCredentialServer()
 	_ = rva.diskManager.DetachUserDataDisk()
-	limaCmd := rva.createVMRemoveCommand(force)
-	if force {
-		rva.logger.Info("Forcibly removing Finch virtual machine...")
-	} else {
-		rva.logger.Info("Removing existing Finch virtual machine...")
-	}
-	logs, err := limaCmd.CombinedOutput()
+
+	ctx, cancel := lifecycle.WithSignalHandling(signalBackgroundContext())
+	defer cancel()
+
+	res, err := rva.executor.Remove(ctx, force)
 	if err != nil {
-		rva.logger.Errorf("Finch virtual machine failed to remove, debug logs:\n%s", logs)
-		return err
+		return wrapLifecycleError(err)
 	}
-	rva.logger.Info("Finch virtual machine removed successfully")
+	rva.logger.Info(res.Message)
 	return nil
 }
 
-func (rva *removeVMAction) createVMRemoveCommand(force bool) command.Command {
-	if force {
-		return rva.creator.CreateWithoutStdio("remove", "--force", limaInstanceName)
+func (rva *removeVMAction) stopCredentialServer() {
+	execPath, err := os.Executable()
+	if err != nil {
+		return
 	}
-	return rva.creator.CreateWithoutStdio("remove", limaInstanceName)
+	realPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		realPath = execPath
+	}
+	finchRootPath := filepath.Dir(filepath.Dir(realPath))
+	if err := credserver.StopCredentialServer(finchRootPath); err != nil {
+		rva.logger.Warnf("Failed to stop credential server: %v", err)
+	}
 }
